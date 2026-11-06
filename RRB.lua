@@ -1,4 +1,10 @@
--- RAYCITY X V6.8 - NPC TRAFFIC NOCLIP (CLIENT EXPERIMENT)
+-- RAYCITY X V6.9.1 - STARTUP FIX + AUTO FAIL RECOVERY
+-- V6.9.1: reduce excessive top-level locals to prevent Luau register/local limits.
+-- V6.9: after an authoritative failed quest result, cancel the old PASS route,
+-- wait for server idle, return to Derix, and pick a new playable green R1-R4.
+-- Optional, persisted AUTO FAIL RETRY toggle (ON by default); bounded retries.
+-- Only the game's QuestUI.hideResult may dismiss a verified failed result.
+-- Never auto-activate unrelated reward/Continue buttons or fake completion.
 -- Based on V6.7. Retains all V6.7 speed, quest, channel and save controls.
 -- V6.8: optional client-only NPC traffic pair-hook disable, OFF by default.
 -- NPC traffic collision is simulated by shared.RCDrivePairHooks.traffic.
@@ -44,7 +50,7 @@ if not player then return end
 local pg = player:WaitForChild('PlayerGui', 10)
 if not pg then return end
 
-local NAME = 'RayCityXFullV68'
+local NAME = 'RayCityXFullV691'
 local V66={}
 -- Derix RoadFightData: slots 1..4. Selection is a REQUEST; server checks unlock/level.
 local DERIX_ROUND_QUESTS = {
@@ -63,7 +69,7 @@ for _,oldKey in ipairs({'RayCityX_V6','RaycitySpeedTestUI_V2','RaycitySpeedTestU
     end)
 end
 -- Close prior native UI. The old native driver's Destroying handler stops it.
-for _,previousName in ipairs({'RayCityNativeCruiseV41', 'RayCityNativeCruiseV42', 'RayCityNativeCruiseV43', 'RayCityNativeCruiseV44', 'RayCityNativeCruiseV45', 'RayCityNativeCruiseV46', 'RayCityNativeCruiseV47', 'RayCityX_V6', 'RayCityXFullV6', 'RayCityXFullV62', 'RayCityXFullV63', 'RayCityXFullV64', 'RayCityXFullV65', 'RayCityXFullV66', 'RayCityXFullV67', NAME}) do
+for _,previousName in ipairs({'RayCityNativeCruiseV41', 'RayCityNativeCruiseV42', 'RayCityNativeCruiseV43', 'RayCityNativeCruiseV44', 'RayCityNativeCruiseV45', 'RayCityNativeCruiseV46', 'RayCityNativeCruiseV47', 'RayCityX_V6', 'RayCityXFullV6', 'RayCityXFullV62', 'RayCityXFullV63', 'RayCityXFullV64', 'RayCityXFullV65', 'RayCityXFullV66', 'RayCityXFullV67', 'RayCityXFullV68', 'RayCityXFullV69', NAME}) do
     local oldGui = pg:FindFirstChild(previousName)
     if oldGui then oldGui:Destroy() end
 end
@@ -1545,6 +1551,7 @@ local QuestRequest=QuestRemotes and QuestRemotes:FindFirstChild('QuestRequest')
 local QuestPush=QuestRemotes and QuestRemotes:FindFirstChild('QuestPush')
 local RoadFightRequest=QuestRemotes and QuestRemotes:FindFirstChild('RoadFightRequest')
 local RoadFightUI=requireModule('RBRCQuest','RoadFightUi')
+local QuestUI=requireModule('RBRCQuest','QuestUI') -- game's native mission result display
 local roundRandom=Random.new()
 cycle={enabled=true,claim=true,returnNpc=true,accept=true,stage='IDLE',
     note='WAITING', questId=nil, npcId=nil, npcPos=nil, npcRange=10,
@@ -1563,6 +1570,10 @@ cycle={enabled=true,claim=true,returnNpc=true,accept=true,stage='IDLE',
     -- Diagnostics and bounded, delayed recovery for failed NPC accepts.
     lastAcceptError='-', lastAcceptErrorAt=0,
     retryCycles=0, retryWaitUntil=0, acceptConfirmed=false,
+    -- V6.9: do not stay in FAILED after the server ended a quest.
+    autoFailRetry=true,failCount=0,failStreak=0,failNextAt=0,
+    failUiClosed=false,failRecoveryTrip=false,failNote='READY',
+    failLastReason='-',failBlocked=false,
     autoDismissNpc=true, npcPopupsClosed=0, npcPopupNote='-', lastNpcPopupPoll=0}
 
 local function enabledRounds()
@@ -1639,6 +1650,36 @@ local function rememberQuest(s)
     end
 end
 
+local function setDerixReturnNpc()
+    -- Derix quest-giver is NOT in QuestData's normal NPC spatial index.
+    -- Resolve only from the game's RoadFightData, never an invented position.
+    cycle.npcId=START_NPC_ID
+    local rf=requireModule('RBRCQuest','RoadFightData')
+    local id=tonumber(START_NPC_ID:match('(%d+)$'))
+    if rf and type(rf.fights)=='table' then
+        for _,entry in pairs(rf.fights) do
+            if type(entry)=='table' and tonumber(entry.npcId)==id then
+                local p=entry.pos
+                if type(p)=='table' and tonumber(p[1]) and tonumber(p[2])
+                   and tonumber(p[3]) then
+                    cycle.npcPos=Vector3.new(p[1],p[2],p[3])
+                    cycle.npcRange=10
+                    return true
+                end
+            end
+        end
+    end
+    -- If data is not ready, approachNpc will perform its normal lookup.
+    cycle.npcPos=nil
+    return false
+end
+local function isDerixQuest(id)
+    for _,qid in pairs(DERIX_ROUND_QUESTS) do
+        if tostring(id or '')==tostring(qid) then return true end
+    end
+    return false
+end
+
 if QuestPush and QuestPush:IsA('RemoteEvent') then
     QuestPush.OnClientEvent:Connect(function(packet)
         if not bridge.alive or not cycle.enabled or type(packet)~='table' then return end
@@ -1650,6 +1691,11 @@ if QuestPush and QuestPush:IsA('RemoteEvent') then
             cycle.retryCycles=0
             cycle.retryWaitUntil=0
             cycle.lastAcceptError='-'
+            cycle.failNextAt=0
+            cycle.failUiClosed=false
+            cycle.failRecoveryTrip=false
+            cycle.failBlocked=false
+            cycle.failNote='SERVER '..msg.op
             if msg.mission then rememberQuest(msg.mission) end
             cycle.stage=(msg.op=='started' and bridge.owns) and 'QUEST' or 'WAIT_QUEST'
             cycle.note='QUEST '..msg.op..' BY SERVER'
@@ -1678,13 +1724,44 @@ if QuestPush and QuestPush:IsA('RemoteEvent') then
             if msg.npcId then cycle.npcId=msg.npcId end
             rememberQuest({questId=cycle.questId})
             if cycle.lastResult then
-                cycle.stage='CLAIM';cycle.note='SERVER RESULT: SUCCESS'
+                cycle.failStreak=0
+                cycle.failRecoveryTrip=false
+                cycle.failNote='LAST QUEST SUCCESS'
+                cycle.stage='CLAIM';cycle.note='SERVER RESULT: SUCCESS' 
                 task.defer(function()
                     if bridge.owns then cycleStop('QUEST SUCCESS - DO NOT CHASE OLD PASS') end
                 end)
             else
-                cycle.stage='FAILED';cycle.note='QUEST FAILED (server result)'
-                task.defer(function() if bridge.owns then cycleStop('QUEST FAILED') end end)
+                -- Only a real server result triggers recovery. Never mark an
+                -- incomplete PASS as failed based on distance or GPS timeout.
+                local why=tostring(msg.reasonKey or msg.reason or msg.message or
+                    msg.why or 'SERVER RESULT: success=false')
+                cycle.failLastReason=why
+                cycle.failCount+=1
+                cycle.failStreak+=1
+                cycle.failUiClosed=false
+                cycle.failRecoveryTrip=false
+                cycle.failBlocked=false
+                local lower=string.lower(why)
+                if lower:find('anticheat',1,true) or lower:find('anti-cheat',1,true)
+                   or lower:find('bot detected',1,true) or lower:find('suspicious',1,true)
+                   or lower:find('banned',1,true) then
+                    cycle.failBlocked=true
+                end
+                local delaySeconds=math.min(40,4+4*math.min(cycle.failStreak-1,8))
+                cycle.failNextAt=os.clock()+delaySeconds
+                cycle.stage='FAILED'
+                cycle.failNote='SERVER FAILED / RETRY IN '..delaySeconds..'s'
+                cycle.note='QUEST FAILED: '..why..' / '..cycle.failNote
+                -- Stop tracking a stale checkpoint. Do not run J/reset or a
+                -- lane return toward the completed quest after this packet.
+                task.defer(function()
+                    if not bridge.alive then return end
+                    if bridge.owns then cycleStop('QUEST FAILED - CANCEL OLD PASS') end
+                    unstuck.pending=false;unstuck.lowSince=nil
+                    lane.manual=false
+                    releaseNpcParking()
+                end)
             end
         end
     end)
@@ -1894,8 +1971,18 @@ local function approachNpc(now)
     cycle.lastTalk=now
     cycle.npcDriveAttempts+=1
     if cycle.npcDriveAttempts>6 then
-        cycle.stage='NEED_NPC'
-        cycle.note='FAILED TO REACH NPC AFTER 6 ROAD ROUTES'
+        if cycle.failRecoveryTrip and cycle.autoFailRetry then
+            cycle.retryCycles+=1
+            local pause=math.min(180,20*2^(math.min(cycle.retryCycles-1,4)))
+            cycle.retryWaitUntil=now+pause
+            cycle.npcDriveAttempts=0
+            cycle.stage='RETRY_WAIT'
+            cycle.note='NPC ROUTE FAILED: RETRY IN '..pause..'s'
+            cycle.failNote=cycle.note
+        else
+            cycle.stage='NEED_NPC'
+            cycle.note='FAILED TO REACH NPC AFTER 6 ROAD ROUTES'
+        end
         return
     end
     local target=cycle.npcPos
@@ -2023,6 +2110,14 @@ local function talkAndAccept(now)
     if not cycle.accept then
         cycle.stage='DONE';cycle.note='AT NPC - AUTO ACCEPT DISABLED';return
     end
+    local current=rawQuestState()
+    if cycle.failRecoveryTrip and current and current.state=='running'
+       and now-cycle.resultAt<15 then
+        -- A local Quest mirror can lag behind the authoritative failed result.
+        -- Give it time to clear, then let the server validate each new talk.
+        cycle.note='WAIT CLIENT QUEST MIRROR TO CLEAR'
+        return
+    end
     if type(cycle.npcId)=='string' and cycle.npcId:match('^roadfight:%d+$')
        and #enabledRounds()==0 then
         cycle.note='NO GREEN ROUNDS: ENABLE R1-R4 TO CONTINUE'
@@ -2103,6 +2198,54 @@ local function cycleTick(now)
                 local t,source,obj=chooseDestination()
                 if t then startNative(t,source,obj) end
             end
+        end
+    end
+    -- V6.9: the old code left FAILED forever. Resume only after the game
+    -- has supplied a definitive result and the failed mission is no longer
+    -- running. Do not click an unrelated 'Continue' reward popup.
+    if cycle.stage=='FAILED' then
+        if not cycle.failUiClosed and now-cycle.resultAt>=2.5 then
+            if not QuestUI then QuestUI=requireModule('RBRCQuest','QuestUI') end
+            if QuestUI and type(QuestUI.hideResult)=='function' then
+                local ok=pcall(QuestUI.hideResult)
+                cycle.failNote=ok and 'FAIL RESULT HIDDEN' or 'FAIL UI AUTOHIDE'
+            end
+            cycle.failUiClosed=true
+        end
+        if not cycle.autoFailRetry then
+            cycle.failNote='AUTO FAIL RETRY OFF: MANUAL START'
+        elseif cycle.failBlocked then
+            cycle.failNote='SERVER RESTRICTION: MANUAL REVIEW'
+        elseif #enabledRounds()==0 then
+            cycle.failNote='NO GREEN ROUNDS: ENABLE R1-R4'
+        elseif raw and raw.state=='running' and now-cycle.resultAt<10 then
+            cycle.failNote='WAIT CLIENT QUEST MIRROR TO CLEAR'
+        elseif now<cycle.failNextAt then
+            cycle.failNote='RETURN NPC IN '..math.ceil(cycle.failNextAt-now)..'s'
+        else
+            -- Never reuse the old PASS goal. Restore the real quest NPC.
+            local derix=isDerixQuest(cycle.questId)
+                or cycle.npcId==START_NPC_ID
+            if derix then setDerixReturnNpc() end
+            cycle.startedSignal=false
+            cycle.acceptConfirmed=false
+            cycle.acceptAttempts=0
+            cycle.npcDriveAttempts=0
+            cycle.retryCycles=0
+            cycle.retryWaitUntil=0
+            cycle.waitQuestAt=0
+            cycle.lastTalk=0
+            cycle.lastAccept=0
+            cycle.claimed=false
+            cycle.replanAt=0
+            cycle.failRecoveryTrip=true
+            cycle.failNextAt=0
+            cycle.stage='RETURN_NPC'
+            cycle.failNote='RETURNING TO NPC FOR RANDOM QUEST'
+            cycle.note='FAILED QUEST RECOVERY: RETURN NPC'
+        end
+        if cycle.stage=='FAILED' then
+            cycle.note='FAILED #'..cycle.failCount..' | '..cycle.failNote
         end
     end
     if cycle.stage=='WAIT_QUEST' and not bridge.owns and cycle.waitQuestAt>0
@@ -2658,7 +2801,7 @@ local frame=roundUI(makeUI('Frame',gui,{Size=UDim2.fromOffset(370,466),
 makeUI('UIStroke',frame,{Color=COLORS.border,Thickness=1})
 local header=makeUI('Frame',frame,{Size=UDim2.new(1,0,0,45),
     BackgroundTransparency=1})
-textUI(header,'RAYCITY X | V6.8',UDim2.fromOffset(13,0),UDim2.new(1,-100,1,0),
+textUI(header,'RAYCITY X | V6.9.1',UDim2.fromOffset(13,0),UDim2.new(1,-100,1,0),
     17,COLORS.text).Font=Enum.Font.GothamBold
 local miniButton=buttonUI(header,'−',301,9,29,28,COLORS.gray)
 local quit=buttonUI(header,'X',337,9,27,28,COLORS.red)
@@ -2729,7 +2872,7 @@ local laneButton=buttonUI(laneCard,'AUTO LANE: OFF',12,40,156,31,COLORS.gray)
 local laneTestButton=buttonUI(laneCard,'TRY LANE NOW',178,40,157,31,COLORS.blue)
 local laneLine=textUI(laneCard,'OFF. Test only on open straight roads.',
     UDim2.fromOffset(12,79),UDim2.new(1,-24,0,70),11,COLORS.muted)
-local npcCard=cardUI(pages.DRIVE,'NPC APPROACH / V6.8',78)
+local npcCard=cardUI(pages.DRIVE,'NPC APPROACH / V6.9.1',78)
 local npcStopLine=textUI(npcCard,'Waiting for return trip',
     UDim2.fromOffset(12,36),UDim2.new(1,-24,0,35),11,COLORS.muted)
 
@@ -2745,7 +2888,7 @@ textUI(unstuckCard,'Below 5 km/h for 3s while driving',UDim2.fromOffset(12,36),
 local unstuckButton=buttonUI(unstuckCard,'AUTO J: ON',12,70,155,29,COLORS.green)
 local unstuckStatus=textUI(unstuckCard,'',UDim2.fromOffset(175,69),
     UDim2.fromOffset(163,30),11,COLORS.muted)
-escape.ui.card=cardUI(pages.SP,'REVERSE RECOVERY / V6.7',153)
+escape.ui.card=cardUI(pages.SP,'REVERSE RECOVERY / V6.9.1',153)
 textUI(escape.ui.card,'Used only while J is cooling down and car is stuck',
     UDim2.fromOffset(12,33),UDim2.new(1,-20,0,23),11,COLORS.muted)
 escape.ui.button=buttonUI(escape.ui.card,'AUTO REVERSE: OFF',12,63,155,30,COLORS.gray)
@@ -2755,19 +2898,23 @@ escape.ui.status=textUI(escape.ui.card,'OFF: safe trial mode',
     UDim2.fromOffset(178,96),UDim2.fromOffset(157,47),10,COLORS.muted)
 
 -- QUEST: Derix rounds, auto loop, reward, original native quest logic.
-local questCard=cardUI(pages.QUEST,'DERIX ROAD FIGHT',119)
+V66.questCard=cardUI(pages.QUEST,'DERIX ROAD FIGHT',119)
 local tierButtons={}
-for i=1,4 do tierButtons[i]=buttonUI(questCard,'R'..i,12+(i-1)*82,37,75,33,COLORS.gray) end
-local startDerix=buttonUI(questCard,'START DERIX RANDOM (1)',12,79,323,34,COLORS.green)
-local questOptions=cardUI(pages.QUEST,'AUTO QUEST',145)
-local loopButton=buttonUI(questOptions,'LOOP: ON',12,39,155,31,COLORS.green)
-local claimButton=buttonUI(questOptions,'CLAIM: ON',178,39,157,31,COLORS.purple)
-local nextButton=buttonUI(questOptions,'NEXT: ON',12,82,155,31,COLORS.blue)
-local npcCloseButton=buttonUI(questOptions,'NPC CLOSE: ON',178,82,157,31,COLORS.gray)
-local questLine=textUI(questOptions,'QUEST: waiting',UDim2.fromOffset(12,117),
+for i=1,4 do tierButtons[i]=buttonUI(V66.questCard,'R'..i,12+(i-1)*82,37,75,33,COLORS.gray) end
+local startDerix=buttonUI(V66.questCard,'START DERIX RANDOM (1)',12,79,323,34,COLORS.green)
+V66.questOptions=cardUI(pages.QUEST,'AUTO QUEST',145)
+local loopButton=buttonUI(V66.questOptions,'LOOP: ON',12,39,155,31,COLORS.green)
+local claimButton=buttonUI(V66.questOptions,'CLAIM: ON',178,39,157,31,COLORS.purple)
+local nextButton=buttonUI(V66.questOptions,'NEXT: ON',12,82,155,31,COLORS.blue)
+local npcCloseButton=buttonUI(V66.questOptions,'NPC CLOSE: ON',178,82,157,31,COLORS.gray)
+V66.questLine=textUI(V66.questOptions,'QUEST: waiting',UDim2.fromOffset(12,117),
     UDim2.new(1,-24,0,22),11,COLORS.muted)
-local debugCard=cardUI(pages.QUEST,'QUEST / ROUTE DEBUG',314)
-local label=textUI(debugCard,'Loading native AutoDrive...',UDim2.fromOffset(10,34),
+V66.failCard=cardUI(pages.QUEST,'FAIL RECOVERY / V6.9.1',118)
+V66.failButton=buttonUI(V66.failCard,'AUTO FAIL RETRY: ON',12,37,323,32,COLORS.green)
+V66.failStatus=textUI(V66.failCard,'Waiting for server result',UDim2.fromOffset(12,75),
+    UDim2.new(1,-24,0,37),11,COLORS.muted)
+V66.debugCard=cardUI(pages.QUEST,'QUEST / ROUTE DEBUG',314)
+local label=textUI(V66.debugCard,'Loading native AutoDrive...',UDim2.fromOffset(10,34),
     UDim2.new(1,-18,0,270),11,COLORS.muted)
 label.Font=Enum.Font.Code
 label.TextXAlignment=Enum.TextXAlignment.Left
@@ -2776,22 +2923,22 @@ label.TextYAlignment=Enum.TextYAlignment.Top
 -- VISUAL: actual toggles: NPC and vehicle Highlights and waypoint marker.
 local visual={npc=false,traffic=false,pass=false}
 local visCard=cardUI(pages.VISUAL,'ESP / MARKERS',161)
-local npcESPButton=buttonUI(visCard,'NPC ESP: OFF',12,40,155,34,COLORS.gray)
-local trafficESPButton=buttonUI(visCard,'CAR ESP: OFF',178,40,157,34,COLORS.gray)
-local passESPButton=buttonUI(visCard,'PASS MARK: OFF',12,84,323,34,COLORS.gray)
-local visualLine=textUI(visCard,'Car radar: waiting',UDim2.fromOffset(12,127),
+V66.npcESPButton=buttonUI(visCard,'NPC ESP: OFF',12,40,155,34,COLORS.gray)
+V66.trafficESPButton=buttonUI(visCard,'CAR ESP: OFF',178,40,157,34,COLORS.gray)
+V66.passESPButton=buttonUI(visCard,'PASS MARK: OFF',12,84,323,34,COLORS.gray)
+V66.visualLine=textUI(visCard,'Car radar: waiting',UDim2.fromOffset(12,127),
     UDim2.new(1,-22,0,24),11,COLORS.muted)
-local radarCard=cardUI(pages.VISUAL,'TRAFFIC RADAR',125)
-local radarLine=textUI(radarCard,'NPC 0 | PLAYER 0',UDim2.fromOffset(12,38),
+V66.radarCard=cardUI(pages.VISUAL,'TRAFFIC RADAR',125)
+V66.radarLine=textUI(V66.radarCard,'NPC 0 | PLAYER 0',UDim2.fromOffset(12,38),
     UDim2.new(1,-22,0,75),12,COLORS.muted)
-local noClipCard=cardUI(pages.VISUAL,'NPC TRAFFIC NOCLIP / V6.8',119)
-local noClipButton=buttonUI(noClipCard,'NPC NOCLIP: OFF',12,40,323,32,COLORS.gray)
-local noClipStatus=textUI(noClipCard,'OFF: NPC traffic only; client experiment',
+V66.noClipCard=cardUI(pages.VISUAL,'NPC TRAFFIC NOCLIP / V6.9.1',119)
+V66.noClipButton=buttonUI(V66.noClipCard,'NPC NOCLIP: OFF',12,40,323,32,COLORS.gray)
+V66.noClipStatus=textUI(V66.noClipCard,'OFF: NPC traffic only; client experiment',
     UDim2.fromOffset(12,80),UDim2.new(1,-24,0,32),11,COLORS.muted)
 
 -- SYSTEM: channels use the game's channel.list -> channel.move protocol.
 -- Auto join never changes channel during a quest/drive. Settings are local.
-V66.channelCard=cardUI(pages.SYSTEM,'CHANNEL / V6.8',351)
+V66.channelCard=cardUI(pages.SYSTEM,'CHANNEL / V6.9.1',351)
 V66.currentChannelLabel=textUI(V66.channelCard,'CURRENT CHANNEL: ...',
     UDim2.fromOffset(12,34),UDim2.new(1,-24,0,23),12,COLORS.text)
 V66.currentChannelLabel.Font=Enum.Font.GothamBold
@@ -2813,7 +2960,7 @@ V66.checkChannelButton=buttonUI(V66.channelCard,'CHECK CHANNELS',12,220,323,31,C
 V66.channelStatus=textUI(V66.channelCard,
     'Low-pop random: ON selects once when idle; not during quest.',
     UDim2.fromOffset(12,262),UDim2.new(1,-24,0,79),11,COLORS.muted)
-V66.settingsCard=cardUI(pages.SYSTEM,'SETTINGS / V6.7',195)
+V66.settingsCard=cardUI(pages.SYSTEM,'SETTINGS / V6.9.1',195)
 V66.autoSaveButton=buttonUI(V66.settingsCard,'AUTO SAVE: ON',12,40,155,31,COLORS.purple)
 V66.saveNowButton=buttonUI(V66.settingsCard,'SAVE NOW',178,40,157,31,COLORS.blue)
 V66.loadNowButton=buttonUI(V66.settingsCard,'LOAD SAVED SETTINGS',12,80,323,31,COLORS.gray)
@@ -2821,11 +2968,11 @@ V66.settingsStatus=textUI(V66.settingsCard,'Checking storage...',
     UDim2.fromOffset(12,118),UDim2.new(1,-24,0,68),11,COLORS.muted)
 
 -- Small floating R launcher, supports mouse and touch dragging.
-local miniLogo=roundUI(makeUI('TextButton',gui,{Name='RLogo',Visible=false,
+V66.miniLogo=roundUI(makeUI('TextButton',gui,{Name='RLogo',Visible=false,
     Size=UDim2.fromOffset(48,48),Position=UDim2.fromOffset(20,118),
     BackgroundColor3=COLORS.purple,BorderSizePixel=0,
     Font=Enum.Font.GothamBlack,Text='R',TextSize=28,TextColor3=COLORS.text}),24)
-makeUI('UIStroke',miniLogo,{Color=rgb(162,122,207),Thickness=1.5})
+makeUI('UIStroke',V66.miniLogo,{Color=rgb(162,122,207),Thickness=1.5})
 local function startDrag(handle,movable,exclude)
     local dragging=false
     local dragInput,origin,beginPos
@@ -2854,13 +3001,13 @@ local function startDrag(handle,movable,exclude)
     return function() return wasDragged end
 end
 startDrag(header,frame,function(pos) return pos.X>header.AbsolutePosition.X+285 end)
-local miniDragged=startDrag(miniLogo,miniLogo)
+V66.miniDragged=startDrag(V66.miniLogo,V66.miniLogo)
 miniButton.MouseButton1Click:Connect(function()
-    frame.Visible=false;miniLogo.Visible=true
+    frame.Visible=false;V66.miniLogo.Visible=true
 end)
-miniLogo.MouseButton1Click:Connect(function()
-    if miniDragged() then return end
-    miniLogo.Visible=false;frame.Visible=true
+V66.miniLogo.MouseButton1Click:Connect(function()
+    if V66.miniDragged() then return end
+    V66.miniLogo.Visible=false;frame.Visible=true
 end)
 
 local highlights={}
@@ -3069,6 +3216,16 @@ npcCloseButton.MouseButton1Click:Connect(function()
     styleSwitch(npcCloseButton,cycle.autoDismissNpc,'NPC CLOSE')
     V66.markSettingsChanged()
 end)
+V66.failButton.MouseButton1Click:Connect(function()
+    cycle.autoFailRetry=not cycle.autoFailRetry
+    V66.failButton.BackgroundColor3=cycle.autoFailRetry and COLORS.green or COLORS.gray
+    styleSwitch(V66.failButton,cycle.autoFailRetry,'AUTO FAIL RETRY')
+    V66.failButton.BackgroundColor3=cycle.autoFailRetry and COLORS.green or COLORS.gray
+    if cycle.stage=='FAILED' then
+        cycle.failNote=cycle.autoFailRetry and 'AUTO RETRY ARMED' or 'AUTO RETRY DISABLED'
+    end
+    V66.markSettingsChanged()
+end)
 for i,b in ipairs(tierButtons) do
     b.MouseButton1Click:Connect(function()
         cycle.roundEnabled[i]=not cycle.roundEnabled[i]
@@ -3095,22 +3252,24 @@ startDerix.MouseButton1Click:Connect(function()
     cycle.npcPos=nil;cycle.acceptProtocol='-';cycle.roadFightOffer='-'
     cycle.acceptAttempts=0;cycle.npcDriveAttempts=0
     cycle.retryCycles=0;cycle.retryWaitUntil=0;cycle.acceptConfirmed=false
+    cycle.failRecoveryTrip=false;cycle.failNextAt=0;cycle.failUiClosed=false
+    cycle.failBlocked=false;cycle.failNote='MANUAL START'
     cycle.lastAcceptError='-'
     cycle.lastTalk=0;cycle.lastAccept=0;cycle.startedSignal=false;cycle.waitQuestAt=0
     rememberQuest({questId=cycle.questId})
     cycle.npcId=START_NPC_ID;cycle.stage='RETURN_NPC'
     cycle.note='START DERIX RANDOM: '..#on..' GREEN ROUND(S)'
 end)
-local evadeButton=buttonUI(radarCard,'AUTO Z/X: OFF',12,80,154,31,COLORS.gray)
-local jumpButton=buttonUI(radarCard,'AUTO JUMP: ON',178,80,157,31,COLORS.gray)
-evadeButton.MouseButton1Click:Connect(function()
+V66.evadeButton=buttonUI(V66.radarCard,'AUTO Z/X: OFF',12,80,154,31,COLORS.gray)
+V66.jumpButton=buttonUI(V66.radarCard,'AUTO JUMP: ON',178,80,157,31,COLORS.gray)
+V66.evadeButton.MouseButton1Click:Connect(function()
     bridge.autoEvade=not bridge.autoEvade
-    styleSwitch(evadeButton,bridge.autoEvade,'AUTO Z/X')
+    styleSwitch(V66.evadeButton,bridge.autoEvade,'AUTO Z/X')
     V66.markSettingsChanged()
 end)
-jumpButton.MouseButton1Click:Connect(function()
+V66.jumpButton.MouseButton1Click:Connect(function()
     bridge.jumpFallback=not bridge.jumpFallback
-    styleSwitch(jumpButton,bridge.jumpFallback,'AUTO JUMP')
+    styleSwitch(V66.jumpButton,bridge.jumpFallback,'AUTO JUMP')
     V66.markSettingsChanged()
 end)
 local function visualToggle(b,key,title)
@@ -3119,9 +3278,9 @@ local function visualToggle(b,key,title)
     V66.markSettingsChanged()
     if not visual[key] then refreshVisual(os.clock()) end
 end
-npcESPButton.MouseButton1Click:Connect(function() visualToggle(npcESPButton,'npc','NPC ESP') end)
-trafficESPButton.MouseButton1Click:Connect(function() visualToggle(trafficESPButton,'traffic','CAR ESP') end)
-passESPButton.MouseButton1Click:Connect(function() visualToggle(passESPButton,'pass','PASS MARK') end)
+V66.npcESPButton.MouseButton1Click:Connect(function() visualToggle(V66.npcESPButton,'npc','NPC ESP') end)
+V66.trafficESPButton.MouseButton1Click:Connect(function() visualToggle(V66.trafficESPButton,'traffic','CAR ESP') end)
+V66.passESPButton.MouseButton1Click:Connect(function() visualToggle(V66.passESPButton,'pass','PASS MARK') end)
 -- V6.6 SETTINGS (backward compatible V6.5 config) -------------------------
 -- File persistence is executor-dependent. If readfile/writefile are missing,
 -- values are retained for repeated injections only in the current session.
@@ -3144,7 +3303,7 @@ function V66.configSnapshot()
         autoJ=unstuck.enabled,reverse=escape.enabled,reverseKeys=escape.inputMode,
         autoLane=lane.enabled,autoZX=bridge.autoEvade,autoJump=bridge.jumpFallback,
         loop=cycle.enabled,claim=cycle.claim,next=bridge.autoNext,
-        npcClose=cycle.autoDismissNpc,
+        npcClose=cycle.autoDismissNpc,failRetry=cycle.autoFailRetry,
         rounds={cycle.roundEnabled[1],cycle.roundEnabled[2],
             cycle.roundEnabled[3],cycle.roundEnabled[4]},
         npcESP=visual.npc,carESP=visual.traffic,passMark=visual.pass,
@@ -3222,13 +3381,15 @@ function V66.styleAllSettings()
     styleSwitch(claimButton,cycle.claim,'CLAIM')
     styleSwitch(nextButton,bridge.autoNext,'NEXT')
     styleSwitch(npcCloseButton,cycle.autoDismissNpc,'NPC CLOSE')
-    styleSwitch(evadeButton,bridge.autoEvade,'AUTO Z/X')
-    styleSwitch(jumpButton,bridge.jumpFallback,'AUTO JUMP')
-    styleSwitch(npcESPButton,visual.npc,'NPC ESP')
-    styleSwitch(trafficESPButton,visual.traffic,'CAR ESP')
-    styleSwitch(passESPButton,visual.pass,'PASS MARK')
-    styleSwitch(noClipButton,npcNoClip.enabled,'NPC NOCLIP')
-    noClipButton.BackgroundColor3=npcNoClip.enabled and COLORS.green or COLORS.gray
+    styleSwitch(V66.failButton,cycle.autoFailRetry,'AUTO FAIL RETRY')
+    V66.failButton.BackgroundColor3=cycle.autoFailRetry and COLORS.green or COLORS.gray
+    styleSwitch(V66.evadeButton,bridge.autoEvade,'AUTO Z/X')
+    styleSwitch(V66.jumpButton,bridge.jumpFallback,'AUTO JUMP')
+    styleSwitch(V66.npcESPButton,visual.npc,'NPC ESP')
+    styleSwitch(V66.trafficESPButton,visual.traffic,'CAR ESP')
+    styleSwitch(V66.passESPButton,visual.pass,'PASS MARK')
+    styleSwitch(V66.noClipButton,npcNoClip.enabled,'NPC NOCLIP')
+    V66.noClipButton.BackgroundColor3=npcNoClip.enabled and COLORS.green or COLORS.gray
     styleSwitch(V66.autoChannelButton,V66.profile.autoChannel,'AUTO CHANNEL')
     styleSwitch(V66.lowPopButton,V66.profile.autoLowPop,'RANDOM LOW POP')
     -- Green means randomized low-pop mode is enabled; gray means disabled.
@@ -3269,6 +3430,7 @@ function V66.applyConfig(cfg,source)
     cycle.claim=V66.bool(cfg,'claim',cycle.claim)
     bridge.autoNext=V66.bool(cfg,'next',bridge.autoNext)
     cycle.autoDismissNpc=V66.bool(cfg,'npcClose',cycle.autoDismissNpc)
+    cycle.autoFailRetry=V66.bool(cfg,'failRetry',cycle.autoFailRetry)
     if type(cfg.rounds)=='table' then
         for i=1,4 do
             if type(cfg.rounds[i])=='boolean' then cycle.roundEnabled[i]=cfg.rounds[i] end
@@ -3321,6 +3483,9 @@ function V66.canSwitchChannel()
     if not bridge.alive then return false,'SCRIPT CLOSED' end
     if bridge.owns or lane.active or escape.active then
         return false,'DRIVING: STOP AUTODRIVE FIRST'
+    end
+    if cycle.stage=='FAILED' and cycle.autoFailRetry then
+        return false,'AUTO FAIL RECOVERY PENDING: CHANNEL BLOCKED'
     end
     if cycle.stage~='IDLE' and cycle.stage~='DONE' and cycle.stage~='FAILED' then
         return false,'QUEST '..tostring(cycle.stage)..': SWITCH BLOCKED'
@@ -3653,10 +3818,10 @@ end)
 V66.checkChannelButton.MouseButton1Click:Connect(function()
     V66.refreshChannels(true)
 end)
-noClipButton.MouseButton1Click:Connect(function()
+V66.noClipButton.MouseButton1Click:Connect(function()
     setNpcNoClip(not npcNoClip.enabled)
-    styleSwitch(noClipButton,npcNoClip.enabled,'NPC NOCLIP')
-    noClipButton.BackgroundColor3=npcNoClip.enabled and COLORS.green or COLORS.gray
+    styleSwitch(V66.noClipButton,npcNoClip.enabled,'NPC NOCLIP')
+    V66.noClipButton.BackgroundColor3=npcNoClip.enabled and COLORS.green or COLORS.gray
     V66.markSettingsChanged()
 end)
 V66.autoSaveButton.MouseButton1Click:Connect(function()
@@ -3689,10 +3854,12 @@ styleSwitch(loopButton,cycle.enabled,'LOOP')
 styleSwitch(claimButton,cycle.claim,'CLAIM')
 styleSwitch(nextButton,bridge.autoNext,'NEXT')
 styleSwitch(npcCloseButton,cycle.autoDismissNpc,'NPC CLOSE')
-styleSwitch(evadeButton,bridge.autoEvade,'AUTO Z/X')
-styleSwitch(jumpButton,bridge.jumpFallback,'AUTO JUMP')
-styleSwitch(noClipButton,npcNoClip.enabled,'NPC NOCLIP')
-noClipButton.BackgroundColor3=npcNoClip.enabled and COLORS.green or COLORS.gray
+styleSwitch(V66.failButton,cycle.autoFailRetry,'AUTO FAIL RETRY')
+V66.failButton.BackgroundColor3=cycle.autoFailRetry and COLORS.green or COLORS.gray
+styleSwitch(V66.evadeButton,bridge.autoEvade,'AUTO Z/X')
+styleSwitch(V66.jumpButton,bridge.jumpFallback,'AUTO JUMP')
+styleSwitch(V66.noClipButton,npcNoClip.enabled,'NPC NOCLIP')
+V66.noClipButton.BackgroundColor3=npcNoClip.enabled and COLORS.green or COLORS.gray
 local visualTick=0
 local function closeEverything()
     if not bridge.alive then return end
@@ -3877,6 +4044,9 @@ connection=RunService.Heartbeat:Connect(function(dt)
                 ..' | NPC CLOSE '..(cycle.autoDismissNpc and 'ON' or 'OFF'),
             'ACCEPT: '..cycle.acceptProtocol..' | '..cycle.roadFightOffer..' | '..cycle.npcPopupNote,
             'LAST ACCEPT ERROR: '..tostring(cycle.lastAcceptError),
+            'FAIL RECOVERY: '..(cycle.autoFailRetry and 'ON' or 'OFF')
+                ..' / FAILS '..cycle.failCount..' / '..cycle.failNote,
+            'FAIL LAST: '..tostring(cycle.failLastReason),
             'CYCLE: '..cycle.note,
             'CAR: '..(root and root:GetFullName() or 'NOT FOUND'),
             'NATIVE: '..(d and (d.active and 'ACTIVE' or 'IDLE') or 'UNAVAILABLE')..' | OWN: '..tostring(bridge.owns),
@@ -3967,15 +4137,17 @@ connection=RunService.Heartbeat:Connect(function(dt)
         unstuckStatus.Text=unstuck.note..' | #'..unstuck.attempts
         escape.ui.status.Text=tostring(escape.note)
             ..' | '..tostring(escape.attempts)..' tries / '..tostring(escape.successes)..' shifted'
-        questLine.Text='LOOP: '..cycle.stage..' | '..cycle.note
-        radarLine.Text='NPC: '..tostring(bridge.npcRadar or 0)
+        V66.questLine.Text='LOOP: '..cycle.stage..' | '..cycle.note
+        V66.failStatus.Text='FAILS '..cycle.failCount..' | STREAK '..cycle.failStreak
+            ..' | '..cycle.failNote..'\nLAST: '..cycle.failLastReason
+        V66.radarLine.Text='NPC: '..tostring(bridge.npcRadar or 0)
             ..'   PLAYERS: '..tostring(bridge.playerRadar or 0)
             ..'\nTARGET: '..tostring(bridge.hazard or '-')
             ..'\nDIST: '..tostring(bridge.hazardDistance and math.floor(bridge.hazardDistance) or '-')
             ..'   TTC: '..tostring(bridge.hazardTtc and bridge.hazardTtc<100 and string.format('%.1f',bridge.hazardTtc) or '-')
-        noClipStatus.Text=npcNoClip.note..' | apply # '..tostring(npcNoClip.swaps)
+        V66.noClipStatus.Text=npcNoClip.note..' | apply # '..tostring(npcNoClip.swaps)
             ..' | Client only; server may still validate collisions'
-        visualLine.Text='Radar: '..(bridge.evadeNote or '-')
+        V66.visualLine.Text='Radar: '..(bridge.evadeNote or '-')
         V66.currentChannelLabel.Text=V66.currentChannelText()
         V66.lowPopInfo.Text='LOW POP: '..V66.profile.lowPopSummary
         V66.channelStatus.Text='FIXED AUTO '..(V66.profile.autoChannel and 'ON' or 'OFF')..
@@ -3989,4 +4161,4 @@ connection=RunService.Heartbeat:Connect(function(dt)
 end)
 
 if not AUTO then bridge.note='AUTO MODULE NOT FOUND' end
-print('[RayCity X V6.7] Dynamic speed/curve caps + live diagnostics; V6.6 quest, channel, autosave kept')
+print('[RayCity X V6.9.1] Auto failed-quest return/retry; V6.8 NoClip, speed, random quest, channel and autosave retained')
